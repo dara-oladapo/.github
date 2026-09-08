@@ -1,0 +1,16 @@
+# Org-wide default. A repo with its own .github/ISSUE_TEMPLATE/config.yml overrides this file
+# completely, including these contact links — so a repo that adds a config to point at its own
+# Discussions needs to carry the security link across too.
+#
+# Blank issues stay on deliberately. Two forms cannot cover everything, and a report filed in the
+# wrong shape is better than one that never gets filed.
+blank_issues_enabled: true
+
+contact_links:
+  - name: Question or general discussion
+    url: https://github.com/orgs/dara-oladapo/discussions
+    about: Not sure whether something is a bug? Ask here first — no template to fill in. (Needs org-level Discussions turned on in org settings; until then this link 404s.)
+
+  - name: Security vulnerability
+    url: https://github.com/dara-oladapo/.github/blob/main/SECURITY.md
+    about: Please don't open a public issue for these. This explains where to send it instead.

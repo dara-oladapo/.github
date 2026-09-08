@@ -1,0 +1,53 @@
+name: Feature request
+description: Something the tool should do that it doesn't.
+title: "[Feature] "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Worth knowing before you write: everything in this org is free with no paid tier, so "people would pay for this" is never the argument that lands. The one that does is that it saves someone real time, or stops them losing something.
+
+        These are also small, single-maintainer tools. A request that keeps the tool small is far more likely to happen than one that turns it into a suite.
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: What problem does this solve?
+      description: Describe the situation you're in, not the feature you have in mind. The best solution often isn't the first one either of us thinks of.
+    validations:
+      required: true
+
+  - type: textarea
+    id: today
+    attributes:
+      label: What do you do about it today?
+      description: Including "nothing, I live with it" — that's useful signal about how much it actually costs you.
+    validations:
+      required: true
+
+  - type: textarea
+    id: idea
+    attributes:
+      label: What you have in mind
+      description: Optional. Skip it if you'd rather just describe the problem and let the design fall out of that.
+
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Which platform matters to you
+      options:
+        - Windows
+        - macOS
+        - Both
+        - Linux
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: scope
+    attributes:
+      label: Scope check
+      options:
+        - label: I've searched existing issues for the same idea.
+        - label: I've checked the repo's README — Linux support and platform gaps are usually tracked there rather than per-feature.
