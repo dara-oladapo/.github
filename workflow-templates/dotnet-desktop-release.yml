@@ -1,0 +1,111 @@
+name: Release
+
+# Builds and publishes the Windows installer. Trigger by pushing a tag like `v0.2.0`, or run it
+# manually with an explicit version — useful for re-running a release without re-tagging.
+#
+# Velopack (`vpk`) is what makes the app able to update itself: it produces the Setup.exe, the
+# delta/full nupkgs and the release manifest that the app's in-process update check reads back
+# from GitHub Releases. Attach all of them to the release, not just Setup.exe, or the update
+# check has nothing to compare against.
+#
+# ---------------------------------------------------------------------------------------------
+# Set these for the repo, then delete this comment.
+# ---------------------------------------------------------------------------------------------
+env:
+  APP_PROJECT: src/Example.App/Example.App.csproj
+  TEST_PROJECT: tests/Example.Core.Tests/Example.Core.Tests.csproj
+  WINDOWS_TFM: net10.0-windows10.0.19041.0
+  PACK_ID: ExampleApp
+  MAIN_EXE: Example.App.exe
+  PACK_TITLE: Example App
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Version to release (e.g. 0.2.0) — required for manual runs"
+        required: false
+
+permissions:
+  contents: write
+
+jobs:
+  windows-installer:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v6
+        with:
+          global-json-file: global.json
+
+      - name: Install MAUI Windows workload
+        run: dotnet workload install maui-windows
+
+      - name: Determine version
+        id: version
+        shell: bash
+        run: |
+          if [ -n "${{ github.event.inputs.version }}" ]; then
+            VERSION="${{ github.event.inputs.version }}"
+          else
+            VERSION="${GITHUB_REF_NAME#v}"
+          fi
+          if [ -z "$VERSION" ]; then
+            echo "No version resolved — pass 'version' on workflow_dispatch or push a vX.Y.Z tag." >&2
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+
+      - name: Restore
+        run: dotnet restore ${{ env.APP_PROJECT }}
+
+      # CI does not run on tags, so this is the last gate before something ships.
+      - name: Run tests
+        run: dotnet test ${{ env.TEST_PROJECT }} --configuration Release
+
+      - name: Publish self-contained win-x64
+        run: >
+          dotnet publish ${{ env.APP_PROJECT }}
+          -f ${{ env.WINDOWS_TFM }}
+          -c Release
+          --self-contained
+          -o publish/win-x64
+
+      - name: Install vpk
+        run: dotnet tool install -g vpk
+
+      - name: Pack installer
+        shell: bash
+        run: >
+          vpk pack
+          --packId ${{ env.PACK_ID }}
+          --packVersion "${{ steps.version.outputs.version }}"
+          --packDir publish/win-x64
+          --mainExe ${{ env.MAIN_EXE }}
+          --icon publish/win-x64/appicon.ico
+          --packTitle "${{ env.PACK_TITLE }}"
+          --packAuthors "Dara Oladapo"
+          --outputDir releases/win
+          -y
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: bash
+        run: |
+          gh release create "v${{ steps.version.outputs.version }}" \
+            releases/win/${{ env.PACK_ID }}-win-Setup.exe \
+            "releases/win/${{ env.PACK_ID }}-${{ steps.version.outputs.version }}-full.nupkg" \
+            releases/win/RELEASES \
+            releases/win/releases.win.json \
+            releases/win/assets.win.json \
+            --repo "${{ github.repository }}" \
+            --title "${{ env.PACK_TITLE }} v${{ steps.version.outputs.version }}" \
+            --generate-notes \
+            --latest

@@ -1,0 +1,263 @@
+name: PR Guardian (reusable)
+
+# Watches open PRs, comments with exactly what is blocking each one, and squash-merges it once
+# nothing is.
+#
+# This lives here rather than being copy-pasted into every repo because it never builds anything —
+# it reads check-run and commit-status results and nothing else, so it is genuinely identical
+# across a C# desktop app, a Stream Deck plugin and a pile of shell scripts. One copy means a fix
+# to the merge logic reaches all of them at once.
+#
+# Policy: any PR that is not a draft, has no merge conflict, has actually run CI, and is green gets
+# squash-merged and its branch deleted. No approving review is required — a single-maintainer
+# setting. To change that, don't edit this file: turn on branch protection requiring a review on
+# the repo. GitHub then reports `mergeable_state: blocked`, which this workflow already handles by
+# reporting "held by branch protection" and leaving the PR alone.
+#
+# Call it from a repo with .github/workflows/pr-guardian.yml:
+#
+#   name: PR Guardian
+#   on:
+#     check_suite:
+#       types: [completed]
+#     schedule:
+#       - cron: "17 * * * *"
+#     workflow_dispatch:
+#       inputs:
+#         pr:
+#           description: "PR number to evaluate (blank = every open PR)"
+#           required: false
+#   permissions:
+#     contents: write
+#     pull-requests: write
+#     checks: read
+#     statuses: read
+#   concurrency:
+#     group: pr-guardian-${{ github.event.check_suite.head_sha || github.run_id }}
+#     cancel-in-progress: false
+#   jobs:
+#     guard:
+#       uses: dara-oladapo/.github/.github/workflows/pr-guardian.yml@main
+#       with:
+#         pr: ${{ inputs.pr }}
+#
+# Deliberately NOT triggered on `pull_request` in the caller: that runs the workflow from the PR
+# head, which would let a PR rewrite the guardian judging it. `check_suite` and `schedule` always
+# run from the default branch.
+
+on:
+  workflow_call:
+    inputs:
+      pr:
+        description: "PR number to evaluate (blank = every open PR)"
+        required: false
+        type: string
+        default: ""
+      merge-method:
+        description: "merge | squash | rebase"
+        required: false
+        type: string
+        default: squash
+
+jobs:
+  guard:
+    # The check run this job produces is named "<caller job name> / pr-guardian". The script below
+    # matches on the "pr-guardian" substring to exclude itself, so don't name another check in a
+    # calling repo anything containing "pr-guardian" — it would be ignored when deciding green.
+    name: pr-guardian
+    runs-on: ubuntu-latest
+    steps:
+      - name: Evaluate and merge
+        uses: actions/github-script@v7
+        env:
+          INPUT_PR: ${{ inputs.pr }}
+          INPUT_MERGE_METHOD: ${{ inputs.merge-method }}
+        with:
+          script: |
+            const MARKER = '<!-- pr-guardian -->';
+            const SELF_CHECK = 'pr-guardian';
+            const PASSING = new Set(['success', 'neutral', 'skipped']);
+            const MERGE_METHOD = process.env.INPUT_MERGE_METHOD || 'squash';
+            const { owner, repo } = context.repo;
+
+            const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+            // Called as a reusable workflow, the check run is "<caller job> / pr-guardian" rather
+            // than a bare name, so this is a substring test rather than equality.
+            const isSelf = (name) => (name || '').includes(SELF_CHECK);
+
+            // A run triggered by our own check suite completing would trigger another, forever.
+            // Bail before doing any work.
+            if (context.eventName === 'check_suite') {
+              const runs = context.payload.check_suite.check_runs_url
+                ? (await github.request(context.payload.check_suite.check_runs_url)).data.check_runs || []
+                : [];
+              if (runs.length > 0 && runs.every((r) => isSelf(r.name))) {
+                core.info('Triggered by our own check suite — nothing to do.');
+                return;
+              }
+            }
+
+            async function selectPullRequests() {
+              const explicit = process.env.INPUT_PR ? Number(process.env.INPUT_PR) : null;
+              if (explicit) {
+                return [explicit];
+              }
+              // check_suite carries its own PRs, but only for same-repo branches; fall back to
+              // listing open PRs so the hourly sweep covers everything.
+              const fromSuite = (context.payload.check_suite?.pull_requests || []).map((p) => p.number);
+              if (fromSuite.length > 0) {
+                return fromSuite;
+              }
+              const open = await github.paginate(github.rest.pulls.list, {
+                owner, repo, state: 'open', per_page: 100,
+              });
+              return open.map((p) => p.number);
+            }
+
+            // GitHub computes `mergeable` asynchronously and returns null until it is ready.
+            // Treating null as "not mergeable" would block every PR evaluated within a second of
+            // a push.
+            async function fetchWithMergeability(number) {
+              for (let attempt = 0; attempt < 6; attempt++) {
+                const { data } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+                if (data.mergeable !== null || data.state !== 'open') {
+                  return data;
+                }
+                await sleep(3000);
+              }
+              const { data } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+              return data;
+            }
+
+            async function checkState(sha) {
+              const runs = (await github.paginate(github.rest.checks.listForRef, {
+                owner, repo, ref: sha, per_page: 100,
+              })).filter((run) => !isSelf(run.name));
+
+              const combined = await github.rest.repos.getCombinedStatusForRef({ owner, repo, ref: sha });
+              const statuses = (combined.data.statuses || []).filter((s) => !isSelf(s.context));
+
+              const pending = [
+                ...runs.filter((r) => r.status !== 'completed').map((r) => r.name),
+                ...statuses.filter((s) => s.state === 'pending').map((s) => s.context),
+              ];
+              const failing = [
+                ...runs.filter((r) => r.status === 'completed' && !PASSING.has(r.conclusion)).map((r) => r.name),
+                ...statuses.filter((s) => s.state === 'failure' || s.state === 'error').map((s) => s.context),
+              ];
+
+              return { total: runs.length + statuses.length, pending, failing };
+            }
+
+            async function upsertComment(number, body) {
+              const comments = await github.paginate(github.rest.issues.listComments, {
+                owner, repo, issue_number: number, per_page: 100,
+              });
+              const existing = comments.find((c) => c.body?.includes(MARKER));
+              if (existing) {
+                if (existing.body.trim() === body.trim()) {
+                  return; // nothing changed; don't churn the PR timeline
+                }
+                await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+              } else {
+                await github.rest.issues.createComment({ owner, repo, issue_number: number, body });
+              }
+            }
+
+            function render(rows, verdict) {
+              const lines = rows.map(([label, ok, detail]) =>
+                `| ${ok ? '✅' : '⛔'} | **${label}** | ${detail} |`);
+              return [
+                MARKER,
+                '### PR Guardian',
+                '',
+                '| | Check | Detail |',
+                '| --- | --- | --- |',
+                ...lines,
+                '',
+                verdict,
+                '',
+                '---',
+                '_Generated by [Claude Code](https://claude.ai/code)_',
+              ].join('\n');
+            }
+
+            for (const number of await selectPullRequests()) {
+              const pr = await fetchWithMergeability(number);
+
+              if (pr.state !== 'open' || pr.merged) {
+                core.info(`#${number}: not open — skipping.`);
+                continue;
+              }
+              if (pr.head.repo?.full_name !== `${owner}/${repo}`) {
+                core.info(`#${number}: fork PR — skipping (the token cannot delete its branch).`);
+                continue;
+              }
+
+              const checks = await checkState(pr.head.sha);
+
+              const notDraft = !pr.draft;
+              const mergeable = pr.mergeable === true && pr.mergeable_state !== 'dirty';
+              const runnable = checks.total > 0 && checks.pending.length === 0;
+              const green = runnable && checks.failing.length === 0;
+
+              const rows = [
+                ['Ready', notDraft, notDraft ? 'Not a draft' : 'Draft — will not merge'],
+                ['Mergeable', mergeable, mergeable
+                  ? `No conflict with \`${pr.base.ref}\``
+                  : (pr.mergeable === false || pr.mergeable_state === 'dirty'
+                    ? `Merge conflict with \`${pr.base.ref}\` — resolve before this can land`
+                    : `Mergeability unresolved (state: \`${pr.mergeable_state}\`)`)],
+                ['Runnable', runnable, checks.total === 0
+                  ? 'No CI checks ran on this commit — refusing to merge something nothing tested'
+                  : (checks.pending.length > 0
+                    ? `Waiting on: ${checks.pending.join(', ')}`
+                    : `${checks.total} check(s) completed`)],
+                ['Green', green, checks.failing.length > 0
+                  ? `Failing: ${checks.failing.join(', ')}`
+                  : (green ? 'All checks passed' : 'Not yet determined')],
+              ];
+
+              // `blocked` means branch protection is withholding the merge — a required review,
+              // usually. Report it; don't attempt and fail.
+              if (notDraft && mergeable && green && pr.mergeable_state === 'blocked') {
+                await upsertComment(number, render(rows,
+                  '⛔ **Held by branch protection.** Everything passes, but the base branch requires '
+                  + 'something this workflow cannot supply (usually an approving review). '
+                  + 'Approve it and the next sweep will merge it.'));
+                core.notice(`#${number}: green but blocked by branch protection.`);
+                continue;
+              }
+
+              if (!(notDraft && mergeable && green)) {
+                await upsertComment(number, render(rows, '⛔ **Not merging yet.** See the blocked row above.'));
+                core.info(`#${number}: holding.`);
+                continue;
+              }
+
+              try {
+                await github.rest.pulls.merge({
+                  owner, repo,
+                  pull_number: number,
+                  merge_method: MERGE_METHOD,
+                  commit_title: `${pr.title} (#${number})`,
+                });
+                core.notice(`#${number}: ${MERGE_METHOD}-merged.`);
+              } catch (error) {
+                await upsertComment(number, render(rows,
+                  `⛔ **Merge attempt failed:** ${error.message}`));
+                core.warning(`#${number}: merge failed — ${error.message}`);
+                continue;
+              }
+
+              await upsertComment(number, render(rows,
+                `✅ **Merged.** ${MERGE_METHOD === 'squash' ? 'Squashed' : 'Merged'} into \`${pr.base.ref}\`.`));
+
+              try {
+                await github.rest.git.deleteRef({ owner, repo, ref: `heads/${pr.head.ref}` });
+                core.info(`#${number}: deleted branch ${pr.head.ref}.`);
+              } catch (error) {
+                core.warning(`#${number}: merged, but could not delete ${pr.head.ref} — ${error.message}`);
+              }
+            }

@@ -1,0 +1,6 @@
+{
+  "name": "PR Guardian",
+  "description": "Reports what is blocking each open PR and squash-merges it once CI is green. Calls the shared workflow in dara-oladapo/.github.",
+  "iconName": "octicon git-merge",
+  "categories": ["Automation"]
+}

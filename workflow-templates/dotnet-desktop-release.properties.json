@@ -1,0 +1,7 @@
+{
+  "name": ".NET desktop release (Velopack installer)",
+  "description": "On a v* tag, publishes a self-contained win-x64 build, packs a Velopack installer, and attaches it plus the update manifest to a GitHub Release.",
+  "iconName": "octicon package",
+  "categories": ["C#", ".NET", "Deployment"],
+  "filePatterns": ["global.json$"]
+}

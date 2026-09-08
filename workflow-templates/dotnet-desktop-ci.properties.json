@@ -1,0 +1,7 @@
+{
+  "name": ".NET desktop CI (Ubuntu, Windows, macOS)",
+  "description": "Builds and tests a .NET 10 MAUI desktop app on all three platforms, with one aggregate check to require in branch protection.",
+  "iconName": "octicon device-desktop",
+  "categories": ["C#", ".NET", "Continuous integration"],
+  "filePatterns": ["global.json$", ".*\\.slnx$", ".*\\.csproj$"]
+}
